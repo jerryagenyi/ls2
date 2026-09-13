@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# ML model files (1-3GB each — never commit)
+models/
+*.gguf
+*.onnx
+
+# Test audio
+*.wav
+captures/
