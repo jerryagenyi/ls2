@@ -11,3 +11,4 @@ models/
 # Test audio
 *.wav
 captures/
+validation/bin/
