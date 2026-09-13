@@ -17,7 +17,19 @@ Quality notes (flagged, not blockers):
 - Occasional agreement/POS glitches: *«à une heure précises»*, *«va maintenant ministre»* (noun used as verb)
 - Register appropriate for church/conference mix (*équipe de culte*, *dévotion*)
 
-Verdict: **GO**, pending native-speaker sign-off on the results table.
+Verdict: **CONDITIONAL GO** — pending review of the full 20-sentence table by a native French speaker (human review, not spot-checks). Until then this reads as "no obvious blocker found," not "passed."
+
+### 1a. Partial-fragment test (follow-up)
+
+The smoke test above used clean, complete sentences — the live pipeline will feed VAD-chunked fragments instead (design doc section 8). A second test ([`mt/mt_smoke_partials_results.md`](mt/mt_smoke_partials_results.md)) ran 15 deliberately truncated / mid-sentence / short fragments:
+
+- **Hallucinated completion (the real finding):** *"Our target is to raise two million"* → *«Notre objectif est de réunir deux millions **de personnes**.»* — the model invented "de personnes" and closed the sentence. On numbers/amounts this misleads listeners; the speaker's actual continuation arrives later as a *different* sentence.
+- Most truncated fragments dangle faithfully (translated but left incomplete, mirroring the speaker) — acceptable.
+- Mid-sentence starts often guess verb person/number correctly here, but that's luck, not a guarantee.
+- One clause-cut silently dropped a trailing fragment ("from every" vanished).
+- Latency unchanged (44–121 ms).
+
+**PoC design implication:** "translate only finalized ASR segments" is not enough — VAD boundaries emit finalized *mid-sentence* segments. The MT stage needs a sentence-accumulation buffer (hold fragments until sentence-terminal punctuation or a silence threshold) so Opus-MT sees complete sentences. This goes into the PoC script as a requirement, not an optimization.
 
 ## 2. TTS voice audition — Piper French voices
 
@@ -51,9 +63,15 @@ All synth at 15–17x real-time on CPU — never the bottleneck.
 
 ## Deferred
 
-- **whisper.cpp comparison** — no prebuilt v1.9.4 Windows binaries, no local compiler toolchain (cmake/gcc absent). faster-whisper shares the CTranslate2 engine with the MT stage anyway, so the stack stays unified. Revisit if/when the Vulkan GPU path becomes relevant.
+- **whisper.cpp comparison** — not done, and the cheap path doesn't exist: verified v1.9.4 ships **zero prebuilt binaries** (no release assets at all), and this box has no C++ toolchain (cmake/gcc/MSVC absent). Completing this leg requires installing Visual Studio Build Tools (C++ workload) — worth scheduling *before* the optimization phase regardless, since the planned Vulkan GPU path on the AMD card requires building whisper.cpp from source anyway. faster-whisper's numbers stand on their own meanwhile.
 - **Variant selection** (fr_FR confirmed as the only current option; pt_PT vs pt_BR etc. at the per-event audition).
 
 ## Conclusion
 
-All three go/no-go gates for English → French **pass on CPU**: MT quality above bar with negligible latency, TTS real-time with voice choice reduced to a listening preference, ASR 6.7x real-time at the recommended `small` size. The PoC pipeline (design doc section 11, step 1) is unblocked.
+Status by gate, stated accurately:
+
+- **ASR: PASS** (speed, on clean synth audio; RTF 0.15 at `small`, transcript clean). Accuracy on real mic/noisy audio still untested — that's PoC work.
+- **TTS: PASS on speed; voice choice pending audition** (the three samples above). No African French voice exists in Piper — per-event audit if needed.
+- **MT: CONDITIONAL** — clean-sentence output looks strong and latency is negligible, but (a) no native-speaker has reviewed either table yet, and (b) the partial-fragment test found hallucinated completions on truncated input, so the PoC must buffer to sentence boundaries before MT.
+
+Nothing here blocks starting the PoC script — but "validated" means: native-speaker sign-off on [`mt/mt_smoke_results.md`](mt/mt_smoke_results.md) + [`mt/mt_smoke_partials_results.md`](mt/mt_smoke_partials_results.md), and a voice picked from the audition samples. Both are human steps, not code.
