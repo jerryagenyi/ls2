@@ -2,8 +2,9 @@
 
 > Living document: features are captured here as they surface during design, testing, and use.
 > The technical *why/how* lives in `live-ai-interpretation-design.md` (the design doc); test
-> evidence lives in `validation/`. This file says WHAT the product must do — and, to keep
-> everything in one place, ends with a summary of the tech it runs on (section 7).
+> evidence lives in `validation/`; current state (done / in progress / pending) lives in `TODO.md`.
+> This file says WHAT the product must do — and, to keep everything in one place, ends with a
+> summary of the tech it runs on (section 6).
 
 ## 1. Problem
 
@@ -20,13 +21,7 @@ over local WiFi with no app install.
 - **Listener** — opens a browser page, picks a language channel. No install, no account.
 - **Speaker** — unaffected: talks normally, in any of the event's languages. No wearables, no turn-taking, no behavior change required.
 
-## 3. Current state (2026-09-13)
-
-- Validation pass complete for English → French (`validation/validation-report.md`): ASR PASS, TTS speed PASS, MT CONDITIONAL pending native-speaker review.
-- **Live single-pair loop works end-to-end** on the benchmark PC (`live-loop.cmd`): speak English, hear French. Deliberately turn-based (waits for sentence end before translating) — a stage smoke-test, not the product.
-- Blockers to "validated": native-speaker sign-off on both MT tables; final voice pick.
-
-## 4. Features
+## 3. Features
 
 ### F1 — Live interpretation, one language pair (PoC scope)
 Speaker's audio is transcribed, translated, and spoken in one target language in near-real-time, on local hardware. First pair: English → French; then Spanish, Portuguese.
@@ -53,36 +48,29 @@ Operator-facing interface, extending today's LANStreamer dashboard: preselect ev
 ### F7 — Listener distribution
 Reuse LANStreamer as-is: per-language browser channels over local WiFi. Each channel's audio source becomes this system's TTS output for that language (via virtual audio cables) instead of a human interpreter's microphone.
 
-## 5. Non-goals (current phase)
+## 4. Non-goals (current phase)
 
 - Multi-language fan-out before the single-pair PoC works.
 - Packaging/installers — after the PoC works.
 - Unknown venue hardware — runs on team-owned machines; minimum specs defined after the PoC.
 - Cloud models or venue internet — hard constraint: fully local.
 
-## 6. Quality targets (provisional)
+## 5. Quality targets (provisional)
 
 Latency and other starting targets live in the design doc, to be validated once the PoC shows what is actually achievable. Not restated here so they can't drift out of sync.
 
-## 7. Technical foundations
+## 6. Technical foundations
 
-Yes, kept in the PRD on purpose: one document, and the team is technical. Requirements above say *what*; this says *what it runs on*. Decisions and reasoning: design doc.
+Yes, kept in the PRD on purpose: one document, and the team is technical. Requirements above say *what*; this says *what it runs on*. Decisions and reasoning: design doc. How far along it is: `TODO.md`.
 
-| Layer | Choice | Status |
-|---|---|---|
-| ASR | faster-whisper, int8, CPU — `small` recommended | Validated (RTF 0.15, clean transcripts). whisper.cpp + Vulkan GPU comparison deferred — needs VS Build Tools. |
-| Language detection | Whisper's built-in language ID | Planned (F3); not yet tested. |
-| MT | Opus-MT via CTranslate2 int8 (French/Spanish/Portuguese); NLLB-200-distilled-600M fallback for uncovered languages | CONDITIONAL — ~115ms/sentence; native-speaker review of both test tables pending. |
-| TTS | Piper, per-event voices | Speed validated (15–17x real-time); voice pick among 3 fr_FR candidates pending. |
-| Streaming behavior | Silero VAD utterance chunking + sentence-boundary buffer | Proven in the test loop (`validation/scripts/live_loop.py`). |
-| Distribution | LANStreamer + Icecast; VB-Audio virtual cables to route TTS into channels | Existing infrastructure, unchanged. |
-| Hardware (benchmark) | Ryzen 7 5800X, RX 6800 XT 16GB, 64GB RAM, Windows 11 | PoC target machine; general min-spec later. |
+| Layer | Choice |
+|---|---|
+| ASR | faster-whisper, int8, CPU — `small` recommended |
+| Language detection | Whisper's built-in language ID, per utterance — requires a multilingual checkpoint (e.g. `small`, not `small.en`) |
+| MT | Opus-MT via CTranslate2 int8 — one model per **directional** pair, so N preselected languages need N×(N−1) models (F3); French/Spanish/Portuguese covered, NLLB-200-distilled-600M fallback for uncovered languages |
+| TTS | Piper, per-event voices |
+| Streaming behavior | Silero VAD utterance chunking + sentence-boundary buffer before MT (hard requirement — design doc section 8) |
+| Distribution | LANStreamer + Icecast; VB-Audio virtual cables to route TTS into channels |
+| Hardware (benchmark) | Ryzen 7 5800X, RX 6800 XT 16GB, 64GB RAM, Windows 11 |
 
 Key scripts: `live-loop.cmd` (repo-root launcher for the live test loop), `validation/scripts/live_loop.py` (the loop itself), `mt_smoke.py`, `mt_smoke_partials.py`, `asr_bench.py`, `make_tts_samples.sh`.
-
-## 8. Open dependencies
-
-- Native French speaker reviews both MT tables (`validation/mt/mt_smoke_results.md`, `mt_smoke_partials_results.md`) — blocks MT sign-off.
-- Voice pick among `fr_FR-siwis-medium` / `fr_FR-tom-medium` / `fr_FR-upmc-medium`.
-- VS Build Tools install → whisper.cpp build → Vulkan GPU path (optimization phase).
-- Continuous-streaming design that honors sentence-boundary buffering within the latency target.

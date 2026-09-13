@@ -41,7 +41,7 @@ Recommendation: start with (a) for the PoC and early integration; revisit (b) on
 Speaker mic
    │
    ▼
-Streaming ASR (source language)
+Streaming ASR + per-utterance language ID (multilingual checkpoint)
    │
    ▼
    ├──► MT (lang 1) ──► TTS (lang 1) ──► virtual audio cable ──┐
@@ -49,7 +49,7 @@ Streaming ASR (source language)
    └──► MT (lang N) ──► TTS (lang N) ──► virtual audio cable ──┘   (existing)
 ```
 
-ASR runs once regardless of language count; MT and TTS each run once per target language (2–5 parallel chains).
+ASR runs once regardless of language count, detecting the spoken language per utterance (this needs a multilingual checkpoint — e.g. `small`, not `small.en` — see section 2's multi-language scope). The detected language is excluded from the targets for that utterance; MT and TTS then run once per remaining target language. Note the consequence for MT: translation pairs are **directional** — with N preselected languages, every language needs a pair to every other, so N languages means N×(N−1) MT models (3 languages → 6 pairs, not 3).
 
 ## 5. Tech choices (to validate during the PoC)
 
@@ -81,7 +81,7 @@ llm_sts backs this up in practice — every model it uses (Vosk, the LLM APIs, E
 
 ## 6a. Nigerian and African language considerations
 
-This section exists because the risk profile of this whole project changes completely depending on which language(s) are actually being targeted. **The first target language(s) for the first event still need to be decided — this is the single biggest open question in this document, and it should be answered before any PoC code is written.**
+This section exists because the risk profile of this whole project changes completely depending on which language(s) are actually being targeted. **The first event's languages are decided — English → French first, then Spanish and Portuguese (section 2), all served by the standard pipeline. This section matters for the African-language events beyond those, where the risk profile actually changes.**
 
 The three pipeline stages do not carry the same risk for these languages:
 
@@ -103,11 +103,11 @@ Only after this validation pass should the PoC pipeline (section 8, step 1) actu
 
 The validation pass described above has now been run once, for the chosen first pair (English → French), on Jerry's benchmark PC, on CPU. Full results live in the repo: `validation/validation-report.md`, `validation/mt/mt_smoke_results.md`, `validation/tts/samples/`.
 
-- **ASR**: faster-whisper, int8, VAD-chunked. Real-time factor (RTF — how long processing takes relative to the audio's actual duration; lower is faster) came out at tiny 0.03, base 0.05, small 0.15. `small` is recommended — still ~6.7x faster than real-time, and transcripts read cleanly on manual review. **whisper.cpp comparison was not completed** — the benchmark machine is missing a C++ build toolchain needed to compile it, and it turns out there's no shortcut around that: recent whisper.cpp releases don't ship prebuilt binaries (verified — this tracks with a known CI issue in the whisper.cpp project where Windows build artifacts weren't being packaged into releases). The only path is installing a C++ build toolchain (e.g. Visual Studio Build Tools with the C++ workload) and compiling it. Not a PoC blocker (faster-whisper's numbers are comfortable), but worth scheduling before the optimization phase regardless, since the Vulkan GPU path (see the AMD hardware note in section 5) needs a whisper.cpp build either way.
+- **ASR**: faster-whisper, int8, VAD-chunked. Real-time factor (RTF — how long processing takes relative to the audio's actual duration; lower is faster) came out at tiny 0.03, base 0.05, small 0.15. `small` is recommended — still ~6.7x faster than real-time, and transcripts read cleanly on manual review. **whisper.cpp comparison was not completed** — the benchmark machine is missing a C++ build toolchain needed to compile it, and it turns out there's no shortcut around that: recent whisper.cpp releases don't ship prebuilt binaries (verified — this tracks with a known CI issue in the whisper.cpp project where Windows build artifacts weren't being packaged into releases). The only path is installing a C++ build toolchain (e.g. Visual Studio Build Tools with the C++ workload) and compiling it. faster-whisper's numbers are comfortable, so this isn't a PoC blocker — but the Vulkan GPU path (see the AMD hardware note in section 5) needs a whisper.cpp build either way; the toolchain task is tracked in `TODO.md`.
 - **MT**: Opus-MT (English→French, CTranslate2, int8) — ~115ms/sentence average across a 20-sentence test drawn from real talk/agenda text. Names and numbers survived correctly (e.g. "Adebayo", "Emeka Okafor", "deux millions de naira"). **Status: CONDITIONAL, not a full pass.** Two grammar/word-order issues were flagged on the clean-sentence test ("une heure précises" — an agreement error; "va maintenant ministre" — garbled word order). A follow-up test on 15 deliberately truncated/mid-sentence fragments (`validation/mt/mt_smoke_partials_results.md`) then caught something more serious: on the fragment "Our target is to raise two million", Opus-MT produced «...deux millions de personnes» — it invented "of people" and closed the sentence on its own. Most other fragments dangled faithfully (no invention), but this one is exactly the failure mode that matters most for a live event: a confidently wrong number, spoken aloud as if it were correct. **Consequence, recorded in section 8: the PoC's MT stage must buffer input to sentence boundaries before translating — this is now a requirement, not a later optimization.** The gate before trusting MT at all: a native French speaker needs to review both tables (the 20 clean sentences and the 15 fragments), not just the flagged lines.
 - **TTS**: all Piper candidate voices synthesize well above real-time (15–17x), confirming TTS won't be the pipeline's bottleneck. Three Metropolitan French voices are up for audition — `fr_FR-siwis-medium` (female), `fr_FR-tom-medium` (male), `fr_FR-upmc-medium` (female) — samples in `validation/tts/samples/`. Confirmed empirically: no African French Piper voice currently exists, so regional variant stays a per-event decision (section 6a).
 
-**Still open before the PoC script (delivery path step 1) starts:** native-speaker sign-off on both MT tables (clean sentences + fragments), and a final voice pick from the three candidates.
+**What's still open before the PoC script (delivery path step 1) starts is tracked in `TODO.md`** — native-speaker sign-off on both MT tables, and the voice pick.
 
 ## 7. Pre-event glossary feature
 
@@ -156,10 +156,9 @@ These are starting targets to validate once the PoC shows what's actually needed
 
 ## 12. Open questions
 
+*Design questions only. State-of-play items (has the native review happened, which voice is picked, is the toolchain installed) live in `TODO.md`.*
+
 - How long does waiting for a full sentence boundary actually add in practice, for speakers with long or run-on sentences — this now matters because sentence-boundary buffering is a hard requirement (section 8), not optional.
-- Has a native French speaker reviewed both MT tables (the 20 clean sentences and the 15 fragments) — see section 6b?
-- Which of the three Piper voice candidates gets picked (`fr_FR-siwis-medium`, `fr_FR-tom-medium`, `fr_FR-upmc-medium`)?
-- Is a C++ build toolchain available yet to finish the whisper.cpp comparison and unlock its Vulkan GPU path?
 - Which regional variant (fr_FR vs. African French; pt_PT vs. pt_BR; Spanish variant) applies for a given event — decided during the TTS voice audition, not fixed in advance.
 - Exact minimum-spec numbers — pending PoC benchmarking on Jerry's machine.
 - Does the virtual-audio-cable integration hold up under real use, or does it eventually need the direct-feed approach (option b in section 3)?

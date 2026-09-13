@@ -8,22 +8,7 @@ This project handles the *interpretation* (speech → text → translated text �
 
 ## Status
 
-**Pre-PoC validation pass complete.** Core model choices have been smoke-tested on CPU:
-
-- **ASR** (faster-whisper, int8, VAD-chunked): `small` model recommended — runs at ~6.7x real-time, transcripts clean on manual review.
-- **MT** (Opus-MT, English→French, CTranslate2 int8): ~115ms/sentence. Conditional pass — a handful of grammar/word-order glitches are flagged and awaiting native-speaker review before this is locked in. See `validation/mt/mt_smoke_results.md`.
-- **TTS** (Piper): all candidate voices synthesize well above real-time (15–17x). Three Metropolitan French voices are up for audition — no African French Piper voice currently exists, so regional variant remains a per-event decision.
-
-Full results: `validation/validation-report.md`.
-
-**A live single-pair test loop now works end-to-end** on the benchmark PC: run `.\live-loop.cmd` from the repo root, speak English into a mic, hear French from the speakers. It is deliberately turn-based — it waits for a sentence to finish before translating — which is fine for testing each stage; continuous streaming is the PoC pipeline's problem.
-
-**Not yet done:**
-- Native-speaker sign-off on both MT test tables (the 20 clean sentences and the 15 fragmented-input results)
-- Voice selection from the three Piper candidates
-- whisper.cpp benchmark comparison (deferred — missing local C++ build toolchain)
-
-Once the above are resolved, the first PoC pipeline (single script: mic capture → faster-whisper → Opus-MT → Piper → WAV output) is unblocked.
+Tracked in [`TODO.md`](./TODO.md) — what's done, what's blocked, what's next. Validation evidence lives in [`validation/validation-report.md`](./validation/validation-report.md).
 
 ## Why this exists
 
@@ -38,6 +23,7 @@ The full design rationale — architecture, tech choices and why, known failure 
 ```
 ├── live-ai-interpretation-design.md   # full design doc — read this first
 ├── prd.md                             # product requirements — features captured as they emerge
+├── TODO.md                            # tracking — done / in progress / blocked / next
 ├── live-loop.cmd                      # run the live mic→French test loop (from repo root)
 ├── validation/
 │   ├── mt/                            # machine translation smoke test results
@@ -49,7 +35,7 @@ The full design rationale — architecture, tech choices and why, known failure 
 
 ## Getting started
 
-To try the current state locally (Windows, mic + speakers): run `.\live-loop.cmd` from the repo root and speak English — French comes out of the speakers. `.\live-loop.cmd --list-devices` picks a different mic/output; `--voice fr_FR-tom-medium` (or `upmc`) auditions the other voices. The full PoC pipeline (continuous streaming, multi-language) is the next milestone (see Status above).
+To try the current state locally (Windows, mic + speakers): run `.\live-loop.cmd` from the repo root and speak English — French comes out of the speakers. `.\live-loop.cmd --list-devices` picks a different mic/output; `--voice fr_FR-tom-medium` (or `upmc`) auditions the other voices. The full PoC pipeline (continuous streaming, multi-language) is the next milestone (see `TODO.md`).
 
 ## Related projects
 
