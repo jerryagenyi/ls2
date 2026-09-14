@@ -1,18 +1,21 @@
 """Live mic -> ASR -> MT -> TTS loop: speak English, hear French.
 
-Local smoke-test harness, not the step-1 PoC pipeline. Implements the
-section-8 requirement found in validation: fragments are buffered to
-sentence boundaries (terminal punctuation, or a hold timeout) before
-MT, so Opus-MT never sees a truncated fragment it might "complete"
-(the "two million -> deux millions de personnes" failure mode).
+Implements the F2 design (design doc section 13): stages connected by bounded
+queues, a compression policy, and an optional catch-up mode.
+
+Stages: capture (callback) -> segmenter (VAD, main thread) -> ASR+stitcher
+worker -> MT worker -> TTS synth worker -> bounded playback queue -> Player.
+Fragments are buffered to sentence boundaries (terminal punctuation, or a hold
+timeout) before MT, so Opus-MT never sees a truncated fragment it might
+"complete" (the "two million -> deux millions de personnes" failure mode —
+design doc section 8, a hard requirement).
 
 Stages and settings come from the validation pass (validation-report.md):
 ASR = faster-whisper int8 CPU (default small, RTF 0.15); MT = Opus-MT
-en-fr via CTranslate2 int8 (~115ms/sentence); TTS = the same Piper
-voices auditioned in validation/tts/samples.
+en-fr via CTranslate2 int8 (~115ms/sentence); TTS = Piper.
 
 Wear headphones if you can — otherwise the mic hears the French output
-and tries to transcribe it.
+and tries to transcribe it (confirmed runaway feedback, test M7).
 
 Usage (from repo root, venv active):
   python validation/scripts/live_loop.py                  # siwis voice
@@ -24,6 +27,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -53,10 +57,11 @@ def voice_sample_rate(onnx_path: str) -> int:
         return 22050
 
 
-def synthesize(text: str, voice_onnx: str):
+def synthesize(text: str, voice_onnx: str, length_scale: float = 1.0):
     """French text -> int16 mono PCM via the piper binary (--output_raw)."""
     proc = subprocess.run(
-        [PIPER, "--model", voice_onnx, "--output_raw", "-q"],
+        [PIPER, "--model", voice_onnx, "--output_raw", "-q",
+         "--length_scale", str(length_scale)],
         input=(text + "\n").encode("utf-8"),
         capture_output=True,
     )
@@ -64,6 +69,51 @@ def synthesize(text: str, voice_onnx: str):
         print(f"[tts error] {proc.stderr.decode(errors='replace')[:200]}")
         return None
     return np.frombuffer(proc.stdout, dtype=np.int16)
+
+
+# Titles/abbreviations whose period must NOT end a sentence (test M4: "Dr."
+# was split off and its remainder translated as a headless fragment).
+_ABBREV = {"dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st", "vs", "etc",
+           "no", "fig", "e.g", "i.e", "approx", "dept", "est", "inc", "ltd"}
+
+# Filler phrases stripped before MT (design doc 13.4 item 2). Deliberately
+# conservative: only phrases that are never load-bearing. "like" and "so" are
+# NOT stripped — they carry meaning too often.
+_FILLER = re.compile(
+    r"\b(?:um+|uh+|erm+|hmm+|you know|i mean|kind of|sort of)\b[,;]?",
+    re.IGNORECASE,
+)
+
+
+def strip_disfluencies(text: str) -> str:
+    """Remove spoken fillers before MT: shortens output AND cleans MT input."""
+    return re.sub(r"\s{2,}", " ", _FILLER.sub(" ", text)).strip()
+
+
+def complete_sentences(text: str):
+    """Split into (complete sentences, leftover tail lacking terminal punct)."""
+    sentences, cur = [], []
+    for ch in text:
+        cur.append(ch)
+        if ch in ".!?":
+            so_far = "".join(cur)
+            body = so_far[:-1]
+            if not any(c.isalnum() for c in body):
+                # bare/stacked punctuation ("?!", ". . ."): attach to the
+                # previous sentence rather than starting a junk fragment
+                if sentences:
+                    sentences[-1] += ch
+                    cur = []
+                    continue
+                continue
+            last_word = body.rstrip(")").split()[-1] if body.split() else ""
+            if last_word.lower().rstrip(".") in _ABBREV:
+                continue  # abbreviation period, not a sentence end
+            s = so_far.strip()
+            if s:
+                sentences.append(s)
+            cur = []
+    return sentences, "".join(cur).strip()
 
 
 def rss_mb():
@@ -103,6 +153,8 @@ class Stats:
         self.asr_ms = []    # utterance audio -> EN text
         self.mt_ms = []     # EN sentence -> FR text
         self.e2e_ms = []    # utterance end -> FR queued for playback
+        self.dropped = 0    # sentences dropped by catch-up mode
+        self.backlog_max_s = 0.0
 
     def note(self, series, value):
         getattr(self, series).append(value)
@@ -118,18 +170,42 @@ class Stats:
             line("ASR (utterance->EN)", self.asr_ms),
             line("MT  (EN->FR)", self.mt_ms),
             line("E2E (utterance end->FR queued)", self.e2e_ms),
+            f"  dropped (catch-up): {self.dropped}",
+            f"  playback backlog max: {self.backlog_max_s:.1f}s",
         ])
+
+
+class Backlog:
+    """Seconds of synthesized-but-unplayed audio (design doc 13.4)."""
+
+    def __init__(self):
+        self._s = 0.0
+        self.lock = threading.Lock()
+
+    def add(self, dur):
+        with self.lock:
+            self._s += dur
+
+    def sub(self, dur):
+        with self.lock:
+            self._s -= dur
+
+    def seconds(self):
+        with self.lock:
+            return self._s
 
 
 class Player(threading.Thread):
     """Single worker so French sentences play in order, capture never blocks."""
 
-    def __init__(self, voice_onnx: str, device=None):
+    def __init__(self, voice_onnx: str, device=None, backlog=None, stats=None):
         super().__init__(daemon=True)
         self.voice_onnx = voice_onnx
         self.device = device
         self.sample_rate = voice_sample_rate(voice_onnx)
         self.q: "queue.Queue[tuple]" = queue.Queue()
+        self.backlog = backlog
+        self.stats = stats
 
     def run(self):
         import sounddevice as sd
@@ -144,45 +220,15 @@ class Player(threading.Thread):
                 item = self.q.get()
                 if item is None:
                     break
-                text, queued_at = item
-                pcm = synthesize(text, self.voice_onnx)
-                if pcm is not None and pcm.size:
-                    wait_ms = (time.perf_counter() - queued_at) * 1000
-                    stream.write(pcm)
-                    print(f"SPK [wait {wait_ms:4.0f} ms, "
-                          f"{pcm.size / self.sample_rate * 1000:4.0f} ms audio]")
-
-
-# Titles/abbreviations whose period must NOT end a sentence (test M4: "Dr."
-# was split off and its remainder translated as a headless fragment).
-_ABBREV = {"dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st", "vs", "etc",
-           "no", "fig", "e.g", "i.e", "approx", "dept", "est", "inc", "ltd"}
-
-
-def complete_sentences(text: str):
-    """Split into (complete sentences, leftover tail lacking terminal punct)."""
-    sentences, cur = [], []
-    for ch in text:
-        cur.append(ch)
-        if ch in ".!?":
-            so_far = "".join(cur)
-            body = so_far[:-1]
-            if not any(c.isalnum() for c in body):
-                # bare/stacked punctuation ("?!", ". . ."): attach to the
-                # previous sentence rather than starting a junk fragment
-                if sentences:
-                    sentences[-1] += ch
-                    cur = []
-                    continue
-                continue
-            last_word = body.rstrip(")").split()[-1] if body.split() else ""
-            if last_word.lower().rstrip(".") in _ABBREV:
-                continue  # abbreviation period, not a sentence end
-            s = so_far.strip()
-            if s:
-                sentences.append(s)
-            cur = []
-    return sentences, "".join(cur).strip()
+                pcm, queued_at, dur = item
+                if self.backlog is not None and self.stats is not None:
+                    self.stats.backlog_max_s = max(
+                        self.stats.backlog_max_s, self.backlog.seconds())
+                wait_ms = (time.perf_counter() - queued_at) * 1000
+                stream.write(pcm)
+                print(f"SPK [wait {wait_ms:4.0f} ms, {dur * 1000:4.0f} ms audio]")
+                if self.backlog is not None:
+                    self.backlog.sub(dur)
 
 
 def list_devices():
@@ -195,7 +241,8 @@ def list_devices():
 def test_tts(voice: str):
     player = Player(os.path.join(VOICES_DIR, voice + ".onnx"))
     player.start()
-    player.q.put(("Bonjour. Ceci est un test du système de synthèse vocale.", time.perf_counter()))
+    player.q.put(("Bonjour. Ceci est un test du système de synthèse vocale.",
+                  time.perf_counter(), 1.0))
     player.q.put(None)
     player.join(timeout=15)
     print("If you heard both sentences, speakers + Piper are working.")
@@ -212,6 +259,18 @@ def main():
     ap.add_argument("--max-hold", type=float, default=5.0,
                     help="seconds an unpunctuated fragment is held before "
                          "translating it as-is (default 5.0)")
+    ap.add_argument("--length-scale", type=float, default=0.9,
+                    help="Piper speech rate: <1 faster, 1.0 natural (default 0.9)")
+    ap.add_argument("--no-strip", action="store_true",
+                    help="disable disfluency stripping before MT")
+    ap.add_argument("--catchup", action="store_true",
+                    help="enable catch-up mode: when playback backlog exceeds "
+                         "--backlog-threshold, drop oldest un-played sentences "
+                         "(default off, per design doc 13.6 step 4)")
+    ap.add_argument("--backlog-threshold", type=float, default=15.0,
+                    help="seconds of backlog that triggers catch-up (default 15)")
+    ap.add_argument("--playback-queue", type=int, default=16,
+                    help="max sentences waiting for playback (default 16)")
     ap.add_argument("--input-device", default=None)
     ap.add_argument("--output-device", default=None)
     ap.add_argument("--list-devices", action="store_true")
@@ -254,25 +313,101 @@ def main():
 
     translate("Warmup.")
 
-    player = Player(voice_onnx, device=args.output_device)
-    player.start()
     stats = Stats()
+    backlog = Backlog()
     rss0 = rss_mb()
     if rss0 is not None:
         print(f"[mem] working set at start: {rss0:.0f} MB")
     last_rss_log = time.time()
 
-    utt_ended_at = [None]  # closure-safe holder for e2e timing
+    # ---- pipeline queues (design doc 13.2) ----
+    utterance_q: "queue.Queue[np.ndarray]" = queue.Queue()
+    mt_q: "queue.Queue[tuple]" = queue.Queue()
+    synth_q: "queue.Queue[tuple]" = queue.Queue()
+    playback_q: "queue.Queue[tuple]" = queue.Queue(maxsize=args.playback_queue)
 
-    def emit(sentence: str):
-        t0 = time.perf_counter()
-        fr = translate(sentence)
-        dt = (time.perf_counter() - t0) * 1000
-        stats.note("mt_ms", dt)
-        if utt_ended_at[0] is not None:
-            stats.note("e2e_ms", (time.perf_counter() - utt_ended_at[0]) * 1000)
-        print(f"FR  [{dt:5.0f} ms]  {fr}")
-        player.q.put((fr, time.perf_counter()))
+    player = Player(voice_onnx, device=args.output_device,
+                    backlog=backlog, stats=stats)
+    player.start()
+
+    stop = threading.Event()
+
+    def mt_worker():
+        """EN sentence -> FR text."""
+        while not stop.is_set():
+            try:
+                sentence, utt_end = mt_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            t0 = time.perf_counter()
+            fr = translate(sentence)
+            stats.note("mt_ms", (time.perf_counter() - t0) * 1000)
+            if utt_end is not None:
+                stats.note("e2e_ms", (time.perf_counter() - utt_end) * 1000)
+            print(f"FR  [{(time.perf_counter() - t0) * 1000:5.0f} ms]  {fr}")
+            synth_q.put((fr, time.perf_counter()))
+
+    def tts_worker():
+        """FR text -> PCM into the bounded playback queue (13.4 policy)."""
+        while not stop.is_set():
+            try:
+                text, at = synth_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            pcm = synthesize(text, voice_onnx, args.length_scale)
+            if pcm is None or not pcm.size:
+                continue
+            dur = pcm.size / player.sample_rate
+            backlog.add(dur)
+            if (args.catchup and backlog.seconds() > args.backlog_threshold):
+                # drop oldest un-played sentence(s) until back under threshold
+                while backlog.seconds() > args.backlog_threshold * 0.5:
+                    try:
+                        _, _, old_dur = playback_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    backlog.sub(old_dur)
+                    stats.dropped += 1
+                    print("[catch-up] dropped an un-played sentence")
+            playback_q.put((pcm, at, dur))  # blocks when full (backpressure)
+
+    def asr_worker():
+        """Utterance audio -> EN text -> complete sentences (stitcher, sec 8)."""
+        pending, pending_since = "", None
+
+        def flush_hold():
+            nonlocal pending, pending_since
+            if pending:
+                print("[hold expired — translating incomplete fragment]")
+                mt_q.put((pending, None))
+                pending, pending_since = "", None
+
+        while not stop.is_set():
+            try:
+                utt = utterance_q.get(timeout=0.25)
+            except queue.Empty:
+                if pending and time.time() - pending_since > args.max_hold:
+                    flush_hold()
+                continue
+            utt_end = time.perf_counter()
+            t0 = time.perf_counter()
+            segments, _info = asr.transcribe(utt, language="en", beam_size=1)
+            text = " ".join(s.text.strip() for s in segments).strip()
+            if not text:
+                continue
+            stats.note("asr_ms", (time.perf_counter() - t0) * 1000)
+            print(f"\nEN  [{(time.perf_counter() - t0) * 1000:5.0f} ms]  {text}")
+            if not args.no_strip:
+                text = strip_disfluencies(text)
+            pending = f"{pending} {text}".strip()
+            sentences, tail = complete_sentences(pending)
+            pending = tail
+            pending_since = time.time() if tail else None
+            for s in sentences:
+                mt_q.put((s, utt_end))
+
+    for target in (mt_worker, tts_worker, asr_worker):
+        threading.Thread(target=target, daemon=True).start()
 
     chunks = []
     lock = threading.Lock()
@@ -288,27 +423,9 @@ def main():
 
     audio = np.empty(0, dtype=np.float32)
     unchecked = 0         # samples buffered since the last VAD pass
-    pending = ""            # unpunctuated tail held across utterances
-    pending_since = None
 
     def handle_utterance(utt: np.ndarray):
-        nonlocal pending, pending_since
-        utt_ended_at[0] = time.perf_counter()
-        t0 = time.perf_counter()
-        segments, _info = asr.transcribe(utt, language="en", beam_size=1)
-        asr_ms = (time.perf_counter() - t0) * 1000
-        text = " ".join(s.text.strip() for s in segments).strip()
-        if not text:
-            return
-        stats.note("asr_ms", asr_ms)
-        print(f"\nEN  [{asr_ms:5.0f} ms]  {text}")
-        pending = f"{pending} {text}".strip()
-        sentences, tail = complete_sentences(pending)
-        pending = tail
-        pending_since = time.time() if tail else None
-        for s in sentences:
-            emit(s)
-        utt_ended_at[0] = None  # later hold-expired emits aren't charged to this utterance
+        utterance_q.put(utt)
 
     try:
         with sd.InputStream(
@@ -328,12 +445,6 @@ def main():
                 if new:
                     audio = np.concatenate([audio] + new) if audio.size else np.concatenate(new)
                     unchecked += sum(c.size for c in new)
-
-                # Age out a held fragment so it eventually gets translated.
-                if pending and time.time() - pending_since > args.max_hold:
-                    print("[hold expired — translating incomplete fragment]")
-                    emit(pending)
-                    pending, pending_since = "", None
 
                 # VAD pass at most twice per silence window: re-copying and
                 # re-scanning the whole buffer every 0.1s tick is wasted work,
@@ -359,12 +470,13 @@ def main():
                     handle_utterance(utt)
     except ValueError as e:
         # e.g. nonexistent --input-device name (test M9): fail clean, not a traceback
-        player.q.put(None)
+        stop.set()
         sys.exit(f"Audio device error: {e}\n"
                  "Run with --list-devices and pass a name substring that exists.")
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
         player.q.put(None)
         try:
             player.join(timeout=10)
