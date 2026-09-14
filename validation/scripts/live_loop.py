@@ -196,14 +196,20 @@ class Backlog:
 
 
 class Player(threading.Thread):
-    """Single worker so French sentences play in order, capture never blocks."""
+    """Drains the bounded playback queue in order; capture never blocks.
 
-    def __init__(self, voice_onnx: str, device=None, backlog=None, stats=None):
+    `q` IS the pipeline's bounded playback queue (design doc 13.2) — the TTS
+    worker puts PCM into it directly, and catch-up mode drops from it. The
+    sentinel None travels the same queue at shutdown.
+    """
+
+    def __init__(self, voice_onnx: str, device=None, backlog=None, stats=None,
+                 qsize=16):
         super().__init__(daemon=True)
         self.voice_onnx = voice_onnx
         self.device = device
         self.sample_rate = voice_sample_rate(voice_onnx)
-        self.q: "queue.Queue[tuple]" = queue.Queue()
+        self.q: "queue.Queue[tuple]" = queue.Queue(maxsize=qsize)
         self.backlog = backlog
         self.stats = stats
 
@@ -241,8 +247,11 @@ def list_devices():
 def test_tts(voice: str):
     player = Player(os.path.join(VOICES_DIR, voice + ".onnx"))
     player.start()
-    player.q.put(("Bonjour. Ceci est un test du système de synthèse vocale.",
-                  time.perf_counter(), 1.0))
+    pcm = synthesize("Bonjour. Ceci est un test du système de synthèse vocale.",
+                     player.voice_onnx)
+    if pcm is None or not pcm.size:
+        sys.exit("Piper synthesis failed — check the piper binary/voice.")
+    player.q.put((pcm, time.perf_counter(), pcm.size / player.sample_rate))
     player.q.put(None)
     player.join(timeout=15)
     print("If you heard both sentences, speakers + Piper are working.")
@@ -324,10 +333,10 @@ def main():
     utterance_q: "queue.Queue[np.ndarray]" = queue.Queue()
     mt_q: "queue.Queue[tuple]" = queue.Queue()
     synth_q: "queue.Queue[tuple]" = queue.Queue()
-    playback_q: "queue.Queue[tuple]" = queue.Queue(maxsize=args.playback_queue)
 
     player = Player(voice_onnx, device=args.output_device,
-                    backlog=backlog, stats=stats)
+                    backlog=backlog, stats=stats, qsize=args.playback_queue)
+    playback_q = player.q  # the bounded playback queue the Player drains
     player.start()
 
     stop = threading.Event()
@@ -477,7 +486,10 @@ def main():
         pass
     finally:
         stop.set()
-        player.q.put(None)
+        try:
+            player.q.put(None, timeout=2)  # may be full if badly backlogged
+        except queue.Full:
+            pass  # stop is set; Player exits after the current write anyway
         try:
             player.join(timeout=10)
         except KeyboardInterrupt:
