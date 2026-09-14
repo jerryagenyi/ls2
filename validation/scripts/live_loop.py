@@ -66,6 +66,61 @@ def synthesize(text: str, voice_onnx: str):
     return np.frombuffer(proc.stdout, dtype=np.int16)
 
 
+def rss_mb():
+    """Process working-set size in MB (P1 memory watch); None if unavailable."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (n, ctypes.c_size_t) for n in (
+                    "PeakWorkingSetSize", "WorkingSetSize",
+                    "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                    "PagefileUsage", "PeakPagefileUsage")]
+
+        pmc = PMC()
+        pmc.cb = ctypes.sizeof(PMC)
+        if psapi.GetProcessMemoryInfo(
+                k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+            return pmc.WorkingSetSize / 1e6
+    except Exception:
+        pass
+    return None
+
+
+class Stats:
+    """P2 latency instrumentation: per-utterance stage timings + summary."""
+
+    def __init__(self):
+        self.asr_ms = []    # utterance audio -> EN text
+        self.mt_ms = []     # EN sentence -> FR text
+        self.e2e_ms = []    # utterance end -> FR queued for playback
+
+    def note(self, series, value):
+        getattr(self, series).append(value)
+
+    def summary(self) -> str:
+        def line(name, xs):
+            if not xs:
+                return f"  {name}: n/a"
+            return (f"  {name}: n={len(xs)} avg={sum(xs)/len(xs):.0f}ms "
+                    f"max={max(xs):.0f}ms")
+        return "\n".join([
+            "Stats (this session):",
+            line("ASR (utterance->EN)", self.asr_ms),
+            line("MT  (EN->FR)", self.mt_ms),
+            line("E2E (utterance end->FR queued)", self.e2e_ms),
+        ])
+
+
 class Player(threading.Thread):
     """Single worker so French sentences play in order, capture never blocks."""
 
@@ -74,7 +129,7 @@ class Player(threading.Thread):
         self.voice_onnx = voice_onnx
         self.device = device
         self.sample_rate = voice_sample_rate(voice_onnx)
-        self.q: "queue.Queue[str]" = queue.Queue()
+        self.q: "queue.Queue[tuple]" = queue.Queue()
 
     def run(self):
         import sounddevice as sd
@@ -86,12 +141,16 @@ class Player(threading.Thread):
             device=self.device,
         ) as stream:
             while True:
-                text = self.q.get()
-                if text is None:
+                item = self.q.get()
+                if item is None:
                     break
+                text, queued_at = item
                 pcm = synthesize(text, self.voice_onnx)
                 if pcm is not None and pcm.size:
+                    wait_ms = (time.perf_counter() - queued_at) * 1000
                     stream.write(pcm)
+                    print(f"SPK [wait {wait_ms:4.0f} ms, "
+                          f"{pcm.size / self.sample_rate * 1000:4.0f} ms audio]")
 
 
 # Titles/abbreviations whose period must NOT end a sentence (test M4: "Dr."
@@ -136,7 +195,7 @@ def list_devices():
 def test_tts(voice: str):
     player = Player(os.path.join(VOICES_DIR, voice + ".onnx"))
     player.start()
-    player.q.put("Bonjour. Ceci est un test du système de synthèse vocale.")
+    player.q.put(("Bonjour. Ceci est un test du système de synthèse vocale.", time.perf_counter()))
     player.q.put(None)
     player.join(timeout=15)
     print("If you heard both sentences, speakers + Piper are working.")
@@ -197,13 +256,23 @@ def main():
 
     player = Player(voice_onnx, device=args.output_device)
     player.start()
+    stats = Stats()
+    rss0 = rss_mb()
+    if rss0 is not None:
+        print(f"[mem] working set at start: {rss0:.0f} MB")
+    last_rss_log = time.time()
+
+    utt_ended_at = [None]  # closure-safe holder for e2e timing
 
     def emit(sentence: str):
         t0 = time.perf_counter()
         fr = translate(sentence)
         dt = (time.perf_counter() - t0) * 1000
+        stats.note("mt_ms", dt)
+        if utt_ended_at[0] is not None:
+            stats.note("e2e_ms", (time.perf_counter() - utt_ended_at[0]) * 1000)
         print(f"FR  [{dt:5.0f} ms]  {fr}")
-        player.q.put(fr)
+        player.q.put((fr, time.perf_counter()))
 
     chunks = []
     lock = threading.Lock()
@@ -224,17 +293,22 @@ def main():
 
     def handle_utterance(utt: np.ndarray):
         nonlocal pending, pending_since
+        utt_ended_at[0] = time.perf_counter()
+        t0 = time.perf_counter()
         segments, _info = asr.transcribe(utt, language="en", beam_size=1)
+        asr_ms = (time.perf_counter() - t0) * 1000
         text = " ".join(s.text.strip() for s in segments).strip()
         if not text:
             return
-        print(f"\nEN  {text}")
+        stats.note("asr_ms", asr_ms)
+        print(f"\nEN  [{asr_ms:5.0f} ms]  {text}")
         pending = f"{pending} {text}".strip()
         sentences, tail = complete_sentences(pending)
         pending = tail
         pending_since = time.time() if tail else None
         for s in sentences:
             emit(s)
+        utt_ended_at[0] = None  # later hold-expired emits aren't charged to this utterance
 
     try:
         with sd.InputStream(
@@ -244,6 +318,11 @@ def main():
             print("Listening. Speak English, pause at sentence ends. Ctrl+C stops.")
             while True:
                 time.sleep(0.1)
+                if time.time() - last_rss_log > 300:  # P1 memory watch, 5-min cadence
+                    last_rss_log = time.time()
+                    rss = rss_mb()
+                    if rss is not None:
+                        print(f"[mem] working set: {rss:.0f} MB")
                 with lock:
                     new, chunks[:] = chunks[:], []
                 if new:
@@ -291,6 +370,10 @@ def main():
             player.join(timeout=10)
         except KeyboardInterrupt:
             pass  # second Ctrl+C during playback shutdown (test M6) — just exit
+        print("\n" + stats.summary())
+        rss = rss_mb()
+        if rss is not None and rss0 is not None:
+            print(f"[mem] working set: start {rss0:.0f} MB -> end {rss:.0f} MB")
         print("\nStopped.")
 
 
