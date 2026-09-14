@@ -1,18 +1,17 @@
 """Live mic -> ASR -> MT -> TTS loop: speak English, hear French.
 
 Implements the F2 design (design doc section 13): stages connected by bounded
-queues, a compression policy, and an optional catch-up mode.
+queues, incremental in-utterance ASR (section 13.7 recommendation 1), a
+compression ladder (Tiers 0-3), and an optional catch-up mode. Also writes a
+timestamped EN/FR transcript log (PRD F11 groundwork).
 
-Stages: capture (callback) -> segmenter (VAD, main thread) -> ASR+stitcher
-worker -> MT worker -> TTS synth worker -> bounded playback queue -> Player.
-Fragments are buffered to sentence boundaries (terminal punctuation, or a hold
-timeout) before MT, so Opus-MT never sees a truncated fragment it might
-"complete" (the "two million -> deux millions de personnes" failure mode —
-design doc section 8, a hard requirement).
-
-Stages and settings come from the validation pass (validation-report.md):
-ASR = faster-whisper int8 CPU (default small, RTF 0.15); MT = Opus-MT
-en-fr via CTranslate2 int8 (~115ms/sentence); TTS = Piper.
+Stages: capture (callback) -> segmenter (VAD, main thread; cuts partial
+chunks every --partial-sec during dense speech) -> ASR worker (incremental,
+sentence-committed) -> MT worker (Tier 1 merge when behind) -> TTS synth
+worker (Tier 0 dynamic speed-up when behind) -> bounded playback queue ->
+Player. Sentence-boundary buffering before MT remains a hard requirement
+(design doc section 8): the incremental transcriber only commits sentences,
+never partials.
 
 Wear headphones if you can — otherwise the mic hears the French output
 and tries to transcribe it (confirmed runaway feedback, test M7).
@@ -24,6 +23,7 @@ Usage (from repo root, venv active):
   python validation/scripts/live_loop.py --test-tts       # speakers-only check
 """
 import argparse
+import datetime
 import json
 import os
 import queue
@@ -36,6 +36,7 @@ import time
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(ROOT)
 PIPER = os.path.join(ROOT, "bin", "piper", "piper.exe")
 VOICES_DIR = os.path.join(ROOT, "models", "piper_voices")
 MT_DIR = os.path.join(ROOT, "models", "opus-mt-en-fr")
@@ -146,13 +147,83 @@ def rss_mb():
     return None
 
 
+class TranscriptLog:
+    """PRD F11 groundwork: append EN/FR/dropped text as JSONL lines."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def log(self, kind: str, text: str):
+        rec = {"t": datetime.datetime.now().isoformat(timespec="seconds"),
+               "kind": kind, "text": text}
+        line = json.dumps(rec, ensure_ascii=False)
+        with self.lock, open(self.path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+class IncrementalASR:
+    """Streaming ASR over one continuous-speech session (design 13.7 rec 1).
+
+    Audio chunks accumulate; each feed() re-transcribes only the un-committed
+    tail. Sentences become committed (audio offset advances past the segment
+    that closed them) the moment they are complete — so in dense speech,
+    translation starts after --partial-sec, not after the 30s force-flush.
+    The unfinished tail is re-transcribed next feed: Whisper may change its
+    mind about the tail, but committed sentences never change, and the
+    section-8 rule (only complete sentences reach MT) is preserved.
+    """
+
+    def __init__(self, transcribe, stats=None):
+        self._transcribe = transcribe  # (audio) -> list of (text, end_s)
+        self.stats = stats
+        self.buf = np.empty(0, dtype=np.float32)
+        self.committed = 0  # sample offset into buf: transcription is final
+
+    def feed(self, chunk: np.ndarray, final: bool = False):
+        """Returns (new_complete_sentences, tail_text, asr_ms)."""
+        self.buf = (np.concatenate([self.buf, chunk]) if self.buf.size
+                    else chunk)
+        t0 = time.perf_counter()
+        segs = self._transcribe(self.buf[self.committed:])
+        asr_ms = (time.perf_counter() - t0) * 1000
+        if self.stats is not None and segs:
+            self.stats.note("asr_ms", asr_ms)
+
+        texts, ends = [], []
+        for text, end_s in segs:
+            t = text.strip()
+            if t:
+                texts.append(t)
+                ends.append(self.committed + min(int(end_s * SR), self.buf.size))
+        full = " ".join(texts)
+        sentences, tail = complete_sentences(full)
+
+        # Advance commitment past the audio backing the last complete
+        # sentence: include whole segments whose text fits inside the
+        # emitted sentences, plus a small safety margin.
+        if sentences:
+            consumed = " ".join(sentences)
+            cum, new_committed = 0, self.committed
+            for t, e in zip(texts, ends):
+                if cum + len(t) + 1 <= len(consumed) + 1:
+                    cum += len(t) + 1
+                    new_committed = e
+            self.committed = max(0, min(new_committed, self.buf.size) - SR // 5)
+            # drop fully-committed audio from the front (keeps memory flat)
+            self.buf = self.buf[self.committed:]
+            self.committed = 0
+        return sentences, tail, asr_ms
+
+
 class Stats:
     """P2 latency instrumentation: per-utterance stage timings + summary."""
 
     def __init__(self):
-        self.asr_ms = []    # utterance audio -> EN text
+        self.asr_ms = []    # transcription pass duration
         self.mt_ms = []     # EN sentence -> FR text
-        self.e2e_ms = []    # utterance end -> FR queued for playback
+        self.e2e_ms = []    # chunk end -> FR queued for playback
         self.dropped = 0    # sentences dropped by catch-up mode
         self.backlog_max_s = 0.0
 
@@ -167,9 +238,9 @@ class Stats:
                     f"max={max(xs):.0f}ms")
         return "\n".join([
             "Stats (this session):",
-            line("ASR (utterance->EN)", self.asr_ms),
+            line("ASR (per pass)", self.asr_ms),
             line("MT  (EN->FR)", self.mt_ms),
-            line("E2E (utterance end->FR queued)", self.e2e_ms),
+            line("E2E (chunk end->FR queued)", self.e2e_ms),
             f"  dropped (catch-up): {self.dropped}",
             f"  playback backlog max: {self.backlog_max_s:.1f}s",
         ])
@@ -265,6 +336,10 @@ def main():
                     help="faster-whisper size: tiny/base/small (default small)")
     ap.add_argument("--silence", type=float, default=0.8,
                     help="seconds of silence that end an utterance (default 0.8)")
+    ap.add_argument("--partial-sec", type=float, default=6.0,
+                    help="during unbroken speech, transcribe incrementally "
+                         "every this many seconds instead of waiting for a "
+                         "pause (default 6)")
     ap.add_argument("--max-hold", type=float, default=5.0,
                     help="seconds an unpunctuated fragment is held before "
                          "translating it as-is (default 5.0)")
@@ -273,13 +348,15 @@ def main():
     ap.add_argument("--no-strip", action="store_true",
                     help="disable disfluency stripping before MT")
     ap.add_argument("--catchup", action="store_true",
-                    help="enable catch-up mode: when playback backlog exceeds "
-                         "--backlog-threshold, drop oldest un-played sentences "
-                         "(default off, per design doc 13.6 step 4)")
+                    help="enable catch-up mode (design 13.7 ladder: Tier 0 "
+                         "dynamic TTS speed-up + Tier 1 MT merge + Tier 3 drop "
+                         "when badly behind; default off)")
     ap.add_argument("--backlog-threshold", type=float, default=15.0,
                     help="seconds of backlog that triggers catch-up (default 15)")
     ap.add_argument("--playback-queue", type=int, default=16,
                     help="max sentences waiting for playback (default 16)")
+    ap.add_argument("--transcript-dir", default=os.path.join(REPO, "logs"),
+                    help="directory for the JSONL transcript log (F11)")
     ap.add_argument("--input-device", default=None)
     ap.add_argument("--output-device", default=None)
     ap.add_argument("--list-devices", action="store_true")
@@ -322,17 +399,24 @@ def main():
 
     translate("Warmup.")
 
+    def transcribe(audio):
+        segments, _ = asr.transcribe(audio, language="en", beam_size=1)
+        return [(s.text, s.end) for s in segments]
+
     stats = Stats()
     backlog = Backlog()
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    tlog = TranscriptLog(os.path.join(args.transcript_dir, f"transcript-{stamp}.jsonl"))
+    print(f"Transcript log: {tlog.path}")
     rss0 = rss_mb()
     if rss0 is not None:
         print(f"[mem] working set at start: {rss0:.0f} MB")
     last_rss_log = time.time()
 
     # ---- pipeline queues (design doc 13.2) ----
-    utterance_q: "queue.Queue[np.ndarray]" = queue.Queue()
-    mt_q: "queue.Queue[tuple]" = queue.Queue()
-    synth_q: "queue.Queue[tuple]" = queue.Queue()
+    utterance_q: "queue.Queue[tuple]" = queue.Queue()   # (audio, final?)
+    mt_q: "queue.Queue[tuple]" = queue.Queue()          # (sentence, chunk_end)
+    synth_q: "queue.Queue[tuple]" = queue.Queue()       # (fr_text, at)
 
     player = Player(voice_onnx, device=args.output_device,
                     backlog=backlog, stats=stats, qsize=args.playback_queue)
@@ -341,19 +425,36 @@ def main():
 
     stop = threading.Event()
 
+    def behind():
+        """True when catch-up tiers should be active (hysteresis-free check;
+        the drop loop in tts_worker applies the threshold/2 hysteresis)."""
+        return args.catchup and backlog.seconds() > args.backlog_threshold * 0.5
+
     def mt_worker():
-        """EN sentence -> FR text."""
+        """EN sentence -> FR text; Tier 1: merge queued sentences when behind."""
         while not stop.is_set():
             try:
-                sentence, utt_end = mt_q.get(timeout=0.25)
+                sentence, chunk_end = mt_q.get(timeout=0.25)
             except queue.Empty:
                 continue
+            batch = [sentence]
+            if behind():
+                while len(batch) < 3:
+                    try:
+                        s2, _e = mt_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    batch.append(s2)
+                if len(batch) > 1:
+                    print(f"[catch-up tier 1] merging {len(batch)} sentences")
+            text = " ".join(batch)
             t0 = time.perf_counter()
-            fr = translate(sentence)
+            fr = translate(text)
             stats.note("mt_ms", (time.perf_counter() - t0) * 1000)
-            if utt_end is not None:
-                stats.note("e2e_ms", (time.perf_counter() - utt_end) * 1000)
+            if chunk_end is not None:
+                stats.note("e2e_ms", (time.perf_counter() - chunk_end) * 1000)
             print(f"FR  [{(time.perf_counter() - t0) * 1000:5.0f} ms]  {fr}")
+            tlog.log("fr", fr)
             synth_q.put((fr, time.perf_counter()))
 
     def tts_worker():
@@ -363,13 +464,17 @@ def main():
                 text, at = synth_q.get(timeout=0.25)
             except queue.Empty:
                 continue
-            pcm = synthesize(text, voice_onnx, args.length_scale)
+            # Tier 0: speak a notch faster while behind
+            ls = args.length_scale
+            if behind():
+                ls = max(0.7, ls - 0.1)
+            pcm = synthesize(text, voice_onnx, ls)
             if pcm is None or not pcm.size:
                 continue
             dur = pcm.size / player.sample_rate
             backlog.add(dur)
             if (args.catchup and backlog.seconds() > args.backlog_threshold):
-                # drop oldest un-played sentence(s) until back under threshold
+                # Tier 3 (last resort): drop oldest un-played sentence(s)
                 while backlog.seconds() > args.backlog_threshold * 0.5:
                     try:
                         _, _, old_dur, old_text = playback_q.get_nowait()
@@ -378,42 +483,44 @@ def main():
                     backlog.sub(old_dur)
                     stats.dropped += 1
                     print(f"[catch-up] dropped: {old_text}")
+                    tlog.log("dropped", old_text)
             playback_q.put((pcm, at, dur, text))  # blocks when full (backpressure)
 
     def asr_worker():
-        """Utterance audio -> EN text -> complete sentences (stitcher, sec 8)."""
-        pending, pending_since = "", None
+        """Audio -> committed sentences via IncrementalASR; stitcher (sec 8)."""
+        inc = None                     # active continuous-speech session
+        hold_pending, hold_since = "", None  # text-level pending between sessions
 
         def flush_hold():
-            nonlocal pending, pending_since
-            if pending:
+            nonlocal hold_pending, hold_since
+            if hold_pending:
                 print("[hold expired — translating incomplete fragment]")
-                mt_q.put((pending, None))
-                pending, pending_since = "", None
+                tlog.log("en", hold_pending)
+                mt_q.put((hold_pending, None))
+                hold_pending, hold_since = "", None
 
         while not stop.is_set():
             try:
-                utt = utterance_q.get(timeout=0.25)
+                utt, final = utterance_q.get(timeout=0.25)
             except queue.Empty:
-                if pending and time.time() - pending_since > args.max_hold:
+                if hold_pending and time.time() - hold_since > args.max_hold:
                     flush_hold()
                 continue
-            utt_end = time.perf_counter()
-            t0 = time.perf_counter()
-            segments, _info = asr.transcribe(utt, language="en", beam_size=1)
-            text = " ".join(s.text.strip() for s in segments).strip()
-            if not text:
-                continue
-            stats.note("asr_ms", (time.perf_counter() - t0) * 1000)
-            print(f"\nEN  [{(time.perf_counter() - t0) * 1000:5.0f} ms]  {text}")
-            if not args.no_strip:
-                text = strip_disfluencies(text)
-            pending = f"{pending} {text}".strip()
-            sentences, tail = complete_sentences(pending)
-            pending = tail
-            pending_since = time.time() if tail else None
-            for s in sentences:
-                mt_q.put((s, utt_end))
+            chunk_end = time.perf_counter()
+            if inc is None:
+                inc = IncrementalASR(transcribe, stats)
+            sentences, tail, asr_ms = inc.feed(utt, final=final)
+            if sentences:
+                print(f"\nEN  [{asr_ms:5.0f} ms]  " + " ".join(sentences))
+                tlog.log("en", " ".join(sentences))
+                for s in sentences:
+                    s = s if args.no_strip else strip_disfluencies(s)
+                    mt_q.put((s, chunk_end))
+            if final:
+                if tail:
+                    hold_pending = f"{hold_pending} {tail}".strip()
+                    hold_since = time.time()
+                inc = None  # session over; next speech starts fresh
 
     for target in (mt_worker, tts_worker, asr_worker):
         threading.Thread(target=target, daemon=True).start()
@@ -432,9 +539,6 @@ def main():
 
     audio = np.empty(0, dtype=np.float32)
     unchecked = 0         # samples buffered since the last VAD pass
-
-    def handle_utterance(utt: np.ndarray):
-        utterance_q.put(utt)
 
     try:
         with sd.InputStream(
@@ -458,7 +562,7 @@ def main():
                 # VAD pass at most twice per silence window: re-copying and
                 # re-scanning the whole buffer every 0.1s tick is wasted work,
                 # and this caps added end-of-utterance latency at silence/2.
-                if unchecked < SR * args.silence / 2 and audio.size <= SR * 30:
+                if unchecked < SR * args.silence / 2:
                     continue
                 unchecked = 0
 
@@ -472,11 +576,16 @@ def main():
                 trailing = (audio.size - last_end) / SR
                 speech_dur = (last_end - int(ts[0]["start"])) / SR
                 if trailing >= args.silence and speech_dur >= 0.25:
+                    # endpoint: close the utterance, final=True
                     utt, audio = audio[:last_end], audio[last_end:]
-                    handle_utterance(utt)
-                elif audio.size > SR * 30:  # very long unbroken speech: force
-                    utt, audio = audio.copy(), np.empty(0, dtype=np.float32)
-                    handle_utterance(utt)
+                    utterance_q.put((utt, True))
+                elif audio.size > SR * args.partial_sec:
+                    # dense speech, no endpoint in sight: cut a partial chunk
+                    # (keep 0.5s tail in the buffer; IncrementalASR will
+                    # re-transcribe whatever it hasn't committed anyway)
+                    cut = audio.size - SR // 2
+                    utterance_q.put((audio[:cut], False))
+                    audio = audio[cut:]
     except ValueError as e:
         # e.g. nonexistent --input-device name (test M9): fail clean, not a traceback
         stop.set()

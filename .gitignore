@@ -12,3 +12,6 @@ models/
 *.wav
 captures/
 validation/bin/
+
+# Session transcript logs (PRD F11)
+logs/

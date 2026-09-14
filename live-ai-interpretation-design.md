@@ -348,3 +348,33 @@ naturalness mediocre («COVID est toujours en train de piquer»), slang/register
 weak ("cringe"). Consistent with the standing CONDITIONAL MT verdict — the
 native-speaker review (Q1) remains the gate. Dropped-sentence audit trail now
 exists (text logged) so coherence-after-drop can be judged on the next run.
+
+### 13.8 Incremental ASR, catch-up Tiers 0/1, transcript logging (2026-09-15, built)
+
+**Incremental in-utterance ASR (rec 1, built).** Dense speech no longer waits
+for the 30s force-flush: during unbroken speech the segmenter cuts a partial
+chunk every `--partial-sec` (default 6s), and `IncrementalASR` transcribes
+only the un-committed tail. A sentence is *committed* — audio offset advanced,
+audio dropped from the buffer — the moment it completes. The unfinished tail
+is re-transcribed next pass, so Whisper may revise the tail but never a
+committed sentence. The section-8 rule is preserved structurally: only
+complete sentences leave the transcriber. Unit tests cover the
+commit/revise/bounded-buffer contract (`tests/test_incremental_asr.py`).
+The 30s force-flush branch is gone (subsumed). Metric note: E2E is now
+chunk-end→FR-queued; the first-French-audio lag should drop from ~30s to
+~partial-sec + ~3.5s — verify on the next YouTube replay.
+
+**Catch-up Tier 0 + Tier 1 (built).** Tier 0: while backlog > threshold/2,
+TTS length_scale drops by 0.1 (floor 0.7) — faster speech while behind, no
+content loss. Tier 1: while behind, the MT worker merges up to 3 queued
+sentences into one translation call (fewer lead-ins, slightly shorter
+audio). Tier 3 (drop) unchanged, still last resort, still logs dropped text.
+Tier 2 (LLM summarize) remains designed-not-built; Tiers 0+1 may reduce
+drops enough that it's never needed — decide after the next measured replay.
+
+**Transcript logging (PRD F11 groundwork, built).** Every session writes
+`logs/transcript-<stamp>.jsonl` with timestamped records:
+`en` (committed ASR text), `fr` (MT output), `dropped` (catch-up drops —
+the audit trail for judging coherence-after-drop). Console output unchanged.
+Streaming this to the listener page (WebSocket/SSE) lands with the
+dashboard/F7; the JSONL format is the contract it will feed.

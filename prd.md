@@ -57,6 +57,9 @@ The installer/app includes a one-click system check that verifies the machine ca
 ### F10 — Security-software friction (edge case, build later)
 Some antivirus/SmartScreen setups flag apps that bundle binaries like FFmpeg (unsigned installers, especially). When it happens the app must not just fail silently: detect what it can, and show a plain-language message telling the user to allow/trust the app so it can do what it needs to do. Longer term: code-sign the installers, which removes most of this class entirely. Not a priority until packaging (F8) — recorded so it's built for, not discovered at an event.
 
+### F11 — Live read-along transcript on the listener page
+The system already produces both texts as it runs — the English ASR captures and the translated output. Both are logged continuously (timestamped, per language), and the listener page offers an optional read-along view: listeners who want it see the original English and/or the translation streaming as text alongside the audio, and can see when catch-up mode skipped content (transparency for drops). Groundwork (JSONL transcript log) ships with the pipeline now; the streaming-to-browser piece (WebSocket/SSE into the LANStreamer-style listener page) lands with the dashboard/F7 integration.
+
 ## 4. Non-goals (current phase)
 
 - Multi-language fan-out before the single-pair PoC works.
