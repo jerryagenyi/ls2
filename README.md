@@ -25,9 +25,13 @@ The full design rationale — architecture, tech choices and why, known failure 
 ├── prd.md                             # product requirements — features captured as they emerge
 ├── TODO.md                            # tracking — done / in progress / blocked / next
 ├── live-loop.cmd                      # run the live mic→French test loop (from repo root)
+├── requirements.txt                   # pinned Python deps for the venv
+├── docs/
+│   └── test-plan.md                   # automated + manual test plan
 ├── validation/
 │   ├── mt/                            # machine translation smoke test results
 │   ├── tts/                           # TTS voice samples for audition
+│   ├── models/                        # local model copies (gitignored) — no HuggingFace at runtime
 │   ├── scripts/                       # benchmark + test scripts (live_loop.py et al.)
 │   └── validation-report.md           # summary of the pre-PoC validation pass
 └── README.md
@@ -35,7 +39,7 @@ The full design rationale — architecture, tech choices and why, known failure 
 
 ## Getting started
 
-To try the current state locally (Windows, mic + speakers): run `.\live-loop.cmd` from the repo root and speak English — French comes out of the speakers. `.\live-loop.cmd --list-devices` picks a different mic/output; `--voice fr_FR-tom-medium` (or `upmc`) auditions the other voices. The full PoC pipeline (continuous streaming, multi-language) is the next milestone (see `TODO.md`).
+To try the current state locally (Windows, mic + speakers): run `.\live-loop.cmd` from the repo root and speak English — French comes out of the speakers. All models load from `validation/models/` (local copies — no internet/HuggingFace access at runtime); Python dependencies are pinned in `requirements.txt`. `.\live-loop.cmd --list-devices` picks a different mic/output; `--voice fr_FR-tom-medium` (or `upmc`) auditions the other voices. Testing what to do next is in [`docs/test-plan.md`](./docs/test-plan.md). The full PoC pipeline (continuous streaming, multi-language) is the next milestone (see `TODO.md`).
 
 ## Related projects
 

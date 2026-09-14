@@ -1,0 +1,12 @@
+# Direct dependencies for the validation scripts / live loop.
+# Full transitive set: `pip freeze` in the active venv. Python 3.13, Windows.
+ctranslate2==4.8.2
+faster-whisper==1.2.1
+numpy==2.5.3
+sacremoses
+sentencepiece==0.2.2
+sounddevice==0.5.6
+transformers==5.17.0
+
+# dev/test
+pytest>=8

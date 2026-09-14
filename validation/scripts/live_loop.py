@@ -94,13 +94,32 @@ class Player(threading.Thread):
                     stream.write(pcm)
 
 
+# Titles/abbreviations whose period must NOT end a sentence (test M4: "Dr."
+# was split off and its remainder translated as a headless fragment).
+_ABBREV = {"dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st", "vs", "etc",
+           "no", "fig", "e.g", "i.e", "approx", "dept", "est", "inc", "ltd"}
+
+
 def complete_sentences(text: str):
     """Split into (complete sentences, leftover tail lacking terminal punct)."""
     sentences, cur = [], []
     for ch in text:
         cur.append(ch)
         if ch in ".!?":
-            s = "".join(cur).strip()
+            so_far = "".join(cur)
+            body = so_far[:-1]
+            if not any(c.isalnum() for c in body):
+                # bare/stacked punctuation ("?!", ". . ."): attach to the
+                # previous sentence rather than starting a junk fragment
+                if sentences:
+                    sentences[-1] += ch
+                    cur = []
+                    continue
+                continue
+            last_word = body.rstrip(")").split()[-1] if body.split() else ""
+            if last_word.lower().rstrip(".") in _ABBREV:
+                continue  # abbreviation period, not a sentence end
+            s = so_far.strip()
             if s:
                 sentences.append(s)
             cur = []
@@ -158,11 +177,14 @@ def main():
     import ctranslate2
     from faster_whisper import WhisperModel
     from faster_whisper.vad import VadOptions, get_speech_timestamps
-    from transformers import AutoTokenizer
+    from transformers.models.marian.tokenization_marian import MarianTokenizer
 
     print(f"Loading models (ASR={args.asr_model}, MT=opus-mt-en-fr, voice={args.voice})...")
-    asr = WhisperModel(args.asr_model, device="cpu", compute_type="int8")
-    tokenizer = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-fr")
+    asr_dir = os.path.join(ROOT, "models", f"faster-whisper-{args.asr_model}")
+    if not os.path.exists(asr_dir):
+        sys.exit(f"ASR model not downloaded locally: {asr_dir}")
+    asr = WhisperModel(asr_dir, device="cpu", compute_type="int8")
+    tokenizer = MarianTokenizer.from_pretrained(MT_DIR)
     translator = ctranslate2.Translator(MT_DIR, device="cpu", compute_type="int8")
 
     def translate(text: str) -> str:
@@ -196,6 +218,7 @@ def main():
     )
 
     audio = np.empty(0, dtype=np.float32)
+    unchecked = 0         # samples buffered since the last VAD pass
     pending = ""            # unpunctuated tail held across utterances
     pending_since = None
 
@@ -225,6 +248,7 @@ def main():
                     new, chunks[:] = chunks[:], []
                 if new:
                     audio = np.concatenate([audio] + new) if audio.size else np.concatenate(new)
+                    unchecked += sum(c.size for c in new)
 
                 # Age out a held fragment so it eventually gets translated.
                 if pending and time.time() - pending_since > args.max_hold:
@@ -232,8 +256,12 @@ def main():
                     emit(pending)
                     pending, pending_since = "", None
 
-                if audio.size < SR:  # under 1s buffered
+                # VAD pass at most twice per silence window: re-copying and
+                # re-scanning the whole buffer every 0.1s tick is wasted work,
+                # and this caps added end-of-utterance latency at silence/2.
+                if unchecked < SR * args.silence / 2 and audio.size <= SR * 30:
                     continue
+                unchecked = 0
 
                 ts = get_speech_timestamps(audio, vad_opts)
                 if not ts:
@@ -250,11 +278,19 @@ def main():
                 elif audio.size > SR * 30:  # very long unbroken speech: force
                     utt, audio = audio.copy(), np.empty(0, dtype=np.float32)
                     handle_utterance(utt)
+    except ValueError as e:
+        # e.g. nonexistent --input-device name (test M9): fail clean, not a traceback
+        player.q.put(None)
+        sys.exit(f"Audio device error: {e}\n"
+                 "Run with --list-devices and pass a name substring that exists.")
     except KeyboardInterrupt:
         pass
     finally:
         player.q.put(None)
-        player.join(timeout=10)
+        try:
+            player.join(timeout=10)
+        except KeyboardInterrupt:
+            pass  # second Ctrl+C during playback shutdown (test M6) — just exit
         print("\nStopped.")
 
 

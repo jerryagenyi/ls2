@@ -2,8 +2,8 @@
 
 Measures model load time and real-time factor (processing time / audio
 duration) for tiny/base/small on validation/asr/test_audio_en.wav.
-First run downloads models from HuggingFace (Systran/faster-whisper-*).
-Writes validation/asr/asr_benchmark.md.
+Loads models from validation/models/faster-whisper-{size} (local copies,
+no HuggingFace access needed). Writes validation/asr/asr_benchmark.md.
 """
 import os
 import platform
@@ -14,6 +14,7 @@ from faster_whisper import WhisperModel
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIO = os.path.join(ROOT, "asr", "test_audio_en.wav")
 OUT = os.path.join(ROOT, "asr", "asr_benchmark.md")
+MODELS_DIR = os.path.join(ROOT, "models")
 
 SIZES = ["tiny", "base", "small"]
 
@@ -22,7 +23,7 @@ def main():
     rows = []
     for size in SIZES:
         t0 = time.perf_counter()
-        model = WhisperModel(size, device="cpu", compute_type="int8")
+        model = WhisperModel(os.path.join(MODELS_DIR, f"faster-whisper-{size}"), device="cpu", compute_type="int8")
         load_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()

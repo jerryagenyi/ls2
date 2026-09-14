@@ -9,7 +9,7 @@ import os
 import time
 
 import ctranslate2
-from transformers import AutoTokenizer
+from transformers.models.marian.tokenization_marian import MarianTokenizer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(ROOT, "models", "opus-mt-en-fr")
@@ -36,7 +36,7 @@ FRAGMENTS = [
 
 
 def main():
-    tokenizer = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-fr")
+    tokenizer = MarianTokenizer.from_pretrained(MODEL_DIR)
     translator = ctranslate2.Translator(MODEL_DIR, device="cpu", compute_type="int8")
 
     def translate(text: str) -> str:
