@@ -173,7 +173,7 @@ These are starting targets to validate once the PoC shows what's actually needed
 
 *Design questions only. State-of-play items (has the native review happened, which voice is picked, is the toolchain installed) live in `TODO.md`.*
 
-- How long does waiting for a full sentence boundary actually add in practice, for speakers with long or run-on sentences — this now matters because sentence-boundary buffering is a hard requirement (section 8), not optional.
+- How long does waiting for a full sentence boundary actually add in practice, for speakers with long or run-on sentences — this now matters because sentence-boundary buffering is a hard requirement (section 8), not optional. **Partially answered (2026-09-14, `validation/latency/2026-09-14-continuous-speech.md`):** for a speaker talking ~1 minute with only breath pauses, per-sentence end-to-end was ~3.2s (within the eventual ≤5s target) and — the important part — the buffer stitched breath-split fragments correctly with zero hallucinated completions. But playback backlog grows ~1s per second of continuous speech (listener lag reached 15s), so the remaining question is no longer "how long is the boundary wait" but "how does F2 compress output when falling behind" — TTS speedup, disfluency stripping, recency policy.
 - Which regional variant (fr_FR vs. African French; pt_PT vs. pt_BR; Spanish variant) applies for a given event — decided during the TTS voice audition, not fixed in advance.
 - Exact minimum-spec numbers — pending PoC benchmarking on Jerry's machine.
 - Does the virtual-audio-cable integration hold up under real use, or does it eventually need the direct-feed approach (option b in section 3)?
