@@ -179,3 +179,130 @@ These are starting targets to validate once the PoC shows what's actually needed
 - Does the virtual-audio-cable integration hold up under real use, or does it eventually need the direct-feed approach (option b in section 3)?
 - What's the actual latency cost of Icecast's buffering, measured, once we get to the optimization phase?
 - *(Curiosity, not a priority — parked)* **Could listeners join over the internet?** Nothing in the listener path fundamentally requires the LAN — a browser plays an HTTP audio stream either way. The real obstacles are operational: the interpretation PC would need outbound bandwidth for N language streams (uplink at venues is usually the weak side), a reachable public endpoint (relaying through a cheap VPS or tunnel, since the venue machine won't have a public IP), authentication so a conference stream isn't world-readable, and accepting that the "no venue internet dependency" guarantee applies only to generation, not distribution — if the internet is down, remote listeners are down with it. Technically very doable later (Icecast can be relayed/mounted publicly as-is); deliberately out of scope until the local event case is solid.
+
+## 13. F2 design — continuous streaming (draft for review, 2026-09)
+
+Status: draft. Written after the measured baseline
+(`validation/latency/2026-09-14-continuous-speech.md`); nothing here is built yet.
+The baseline's two load-bearing facts: (1) compute is trivially cheap — all model
+work for a sentence is ~0.1s, so F2 is *not* a speed problem; (2) playback
+backlog grows ~1s per second of continuous speech (measured to 22s), so F2 *is*
+a compression problem. Everything below follows from those two facts.
+
+### 13.1 The reframed latency target
+
+The ≤5s target can't mean "speaker's mouth to listener's ear for every word,
+always" — that's mathematically impossible when output audio is as long as
+input speech and the speaker never pauses. Human interpreters don't meet it
+either; they fall behind and compress. Proposed split:
+
+- **Steady-state target (≤5s):** time from a sentence being *complete* to its
+  French audio *starting to play*, when the system is caught up. The baseline
+  shows we're already at ~2.7–3.2s for this in the turn-based loop, without
+  trying.
+- **Catch-up rule (new):** when playback backlog exceeds a threshold (suggest
+  15s to start, tunable), the system is formally "behind" and switches from
+  verbatim mode to catch-up mode until the backlog drains below the threshold.
+  What catch-up mode does is 13.4. The operator sees both states on the
+  dashboard (F6) — this is the AI equivalent of an interpreter's booth light.
+
+### 13.2 Pipeline shape
+
+Stages connected by bounded queues, each stage a thread (processes/services
+only if threads prove insufficient — the llm_sts pattern from section 5 is the
+shape, not necessarily the deployment unit):
+
+```
+mic callback ──► capture buffer (lock, exists today)
+                    │
+                    ▼
+              segmenter (VAD + endpoint, ~1.2s)          [keep]
+                    │  utterance audio
+                    ▼
+              ASR worker (faster-whisper)                 [exists, ~10ms]
+                    │  EN text fragments
+                    ▼
+              sentence stitcher (section 8 rule + abbrevs) [exists, tested]
+                    │  complete sentences (+ max_hold flush)
+                    ▼
+              compression policy (13.4)                   [new — F2's core]
+                    │  0..n sentences per tick
+                    ▼
+              MT worker (Opus-MT)                          [exists, ~80ms]
+                    │  FR text
+                    ▼
+              TTS synth worker (piper subprocess pool)     [exists, ~0.2s]
+                    │  PCM + metadata
+                    ▼
+              playback queue (bounded!)                    [exists, unbounded today]
+```
+
+Rules:
+- **Every queue is bounded.** Today's playback queue is unbounded — that's the
+  mechanism behind the 22s waits. Bounding forces an explicit policy instead of
+  silent accumulation.
+- **ASR never blocks on anything downstream.** Capture is never the bottleneck
+  (baseline: ~10ms/utterance); it must stay that way so segment decisions are
+  never distorted by backpressure.
+- **One serialization point:** playback. Everything upstream can parallelize;
+  audio out is strictly ordered per language.
+- Where today's code already does the right thing (segmenter, stitcher, MT
+  call, piper invocation), F2 is a refactor into this shape, not a rewrite.
+  The pytest suite (U1, I1) is the safety net for the refactor.
+
+### 13.3 What F2 does NOT change
+
+- Sentence-boundary buffering before MT stays a hard requirement (section 8);
+  the stitcher moves, its rule doesn't. Comma/clause-level partial translation
+  is rejected on the hallucination evidence, permanently.
+- One language pair first. Multi-language fan-out is F3 and builds on this
+  pipeline (the MT/TTS column per language is a later fork below the stitcher).
+
+### 13.4 Compression policy (the actual new engineering)
+
+Ordered by cost — each is independently testable, add them cheapest first:
+
+1. **TTS speedup (trivial):** Piper `--length_scale 0.9` (10% faster speech,
+   barely audible). Buys 10% of the backlog permanently. Test: M-series manual
+   check that the voice still sounds natural.
+2. **Disfluency stripping (cheap, local, rule-based first):** remove fillers
+   and repeats before MT — "so", "you know", "kind of", "I mean", stutters,
+   duplicate phrase restarts. Buys 10–20% on improvised speech (the baseline
+   transcripts are full of these), *and* improves MT input quality. Rules first
+   (testable with U-series tests); an ML dep cleaner only if rules visibly
+   mangle meaning.
+3. **Catch-up mode (the real policy):** when backlog > threshold:
+   - concatenate pending backlog sentences into one MT batch (fewer, longer
+     outputs — removes per-sentence padding/lead-ins, modest win), and
+   - if still losing ground, **drop the oldest un-played sentences** (keep the
+     newest), with a soft audible cue (brief tone) so listeners know content
+     was skipped — the interpreter's "falling behind, skipping" move. Dropping
+     is why playback ordering tolerates gaps.
+   - Return to verbatim when backlog < threshold/2 (hysteresis, so it doesn't
+     flap).
+4. **Summarization instead of drop (parked):** a local LLM summarizing the
+   backlog would be the ideal catch-up, but it's a new model class, new
+   hardware math, and new hallucination risk in exactly the worst place.
+   Explicitly out of F2 scope; revisit only if dropping proves unacceptable.
+
+Backlog threshold and drop behavior are *tunable knobs exposed in the admin
+dashboard* (F6), not constants — different events will tolerate different
+lag/fidelity trade-offs.
+
+### 13.5 ASR accuracy under delivery speed (surfaced by the read-aloud baseline)
+
+Fast spoken delivery degraded recognition ("shuttle buses" → "short-tool
+bosses") while MT stayed correct on the same sentences as clean text. Before
+F2 code starts, A/B two cheap knobs on the recorded read-aloud session:
+`beam_size 1 → 5` and an `initial_prompt` seeded with event vocabulary.
+Glossary (F5) is the structural fix and plugs into exactly that prompt slot.
+
+### 13.6 Build order
+
+1. Refactor `live_loop.py` into the 13.2 shape behind the existing pytest
+   suite; no behavior change (verifiable: stats match the baseline's shape).
+2. Bound the playback queue + expose backlog as a metric (log line first).
+3. Add 13.4 items 1–2 (length_scale, disfluency rules) with tests.
+4. Add 13.4 item 3 (catch-up mode) behind a flag, default off.
+5. Re-run the two baseline scenarios (improvised + read-aloud) and compare
+   against `validation/latency/2026-09-14-continuous-speech.md`.

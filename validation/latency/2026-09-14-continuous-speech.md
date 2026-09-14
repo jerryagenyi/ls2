@@ -47,3 +47,22 @@ Per-sentence E2E is already ~3.2 s in this turn-based loop. The target is only
 threatened by continuous-speech backlog (finding 3), which no amount of faster
 models can fix — it needs compression. This should be the first thing F2
 prototypes.
+
+## Second session (same day): reading written speech aloud
+
+Same mt_smoke sentences read from the page, conference-style, no deliberate
+pauses at sentence ends. Stats: ASR n=8 avg 8 ms; MT n=24 avg 80 ms; E2E avg
+2,677 ms max 3,967 ms; memory 557→531 MB. Playback waits reached **22.2 s** —
+worse than improvised speech, since reading flows with fewer pauses.
+
+**Cross-check against `mt_smoke_results.md` (the important result):** the same
+sentences translated *correctly* as clean text ("shuttle buses" → «Navettes»,
+Pastor Emeka Okafor, Kano) but came out garbled live ("short-tool bosses",
+"Legos", "pastoral mecca or comfort", "Cano"). Same MT model both times — the
+degradation is entirely ASR-side under fast spoken delivery. MT sign-off
+evidence is unaffected; ASR accuracy under delivery speed is the new open
+front. Cheap levers to test: `beam_size>1` in the live loop (bench didn't use
+1), `initial_prompt` biasing; glossary (F5) is the structural fix.
+
+Sentence buffer again stitched a cross-utterance fragment correctly
+("school project in JOS" → «...projet scolaire à JOS»).
