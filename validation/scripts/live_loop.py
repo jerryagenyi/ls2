@@ -226,7 +226,7 @@ class Player(threading.Thread):
                 item = self.q.get()
                 if item is None:
                     break
-                pcm, queued_at, dur = item
+                pcm, queued_at, dur, _text = item
                 if self.backlog is not None and self.stats is not None:
                     self.stats.backlog_max_s = max(
                         self.stats.backlog_max_s, self.backlog.seconds())
@@ -251,7 +251,7 @@ def test_tts(voice: str):
                      player.voice_onnx)
     if pcm is None or not pcm.size:
         sys.exit("Piper synthesis failed — check the piper binary/voice.")
-    player.q.put((pcm, time.perf_counter(), pcm.size / player.sample_rate))
+    player.q.put((pcm, time.perf_counter(), pcm.size / player.sample_rate, "test"))
     player.q.put(None)
     player.join(timeout=15)
     print("If you heard both sentences, speakers + Piper are working.")
@@ -372,13 +372,13 @@ def main():
                 # drop oldest un-played sentence(s) until back under threshold
                 while backlog.seconds() > args.backlog_threshold * 0.5:
                     try:
-                        _, _, old_dur = playback_q.get_nowait()
+                        _, _, old_dur, old_text = playback_q.get_nowait()
                     except queue.Empty:
                         break
                     backlog.sub(old_dur)
                     stats.dropped += 1
-                    print("[catch-up] dropped an un-played sentence")
-            playback_q.put((pcm, at, dur))  # blocks when full (backpressure)
+                    print(f"[catch-up] dropped: {old_text}")
+            playback_q.put((pcm, at, dur, text))  # blocks when full (backpressure)
 
     def asr_worker():
         """Utterance audio -> EN text -> complete sentences (stitcher, sec 8)."""

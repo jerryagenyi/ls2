@@ -306,3 +306,45 @@ Glossary (F5) is the structural fix and plugs into exactly that prompt slot.
 4. Add 13.4 item 3 (catch-up mode) behind a flag, default off.
 5. Re-run the two baseline scenarios (improvised + read-aloud) and compare
    against `validation/latency/2026-09-14-continuous-speech.md`.
+
+### 13.7 Catch-up redesign + expectation calibration (2026-09-14, post first live --catchup run)
+
+First live catch-up run (`validation/latency/2026-09-14-youtube-run.md`): backlog
+bounded at 12.5s (vs 30.9s unbounded without), but 9 of 19 sentences dropped
+(~47% content retention) — too blunt as the only tool. Decisions:
+
+**Catch-up becomes a ladder (escalate only when cheaper tiers lose ground):**
+- **Tier 0 — dynamic speed-up:** length_scale 0.9 → ~0.8 while in catch-up,
+  recover on exit. Zero content cost. (Not yet built.)
+- **Tier 1 — merge:** concatenate pending backlog sentences into one MT call.
+  (Designed in 13.4, not yet built.)
+- **Tier 2 — summarize (UN-PARKED):** a small local LLM compresses backlog
+  sentences before MT (N → 1). Originally parked on hallucination risk; that
+  risk is much lower than first weighed because the LLM sees clean transcribed
+  text, not shaky audio. Jerry's PC already hosts Qwen GGUF models + llama.cpp
+  is viable on the hardware. Still flag-gated, and never on the live path
+  unless enabled. (Not yet built.)
+- **Tier 3 — drop (last resort):** keep, but now logs the dropped *text*
+  (built 2026-09-14) and must gain the audible cue before any real event.
+
+**Expectation calibration against human interpreters (the reference for our
+thresholds):** professional simultaneous interpreters run an ear-voice span of
+~2–6s (typically 2–4s), and under dense/fast speech they fall behind and cope
+by compressing and omitting — substantial omission under density is documented
+and accepted professional practice, not failure. Therefore our targets are:
+- **≤5s steady-state** (already ~3.5s measured) — when the speaker pauses
+  normally.
+- **Bounded lag ~10–15s under dense speech** with compression — what catch-up
+  mode enforces.
+- **Content retention as a first-class metric** alongside latency: % of
+  translated content actually delivered to listeners. First measured value:
+  ~47% under dense podcast speech — roughly the human ballpark for that
+  density. Every future catch-up change reports retention, not just latency.
+A guaranteed ≤5s for every word under all conditions is not a real target —
+not for this system, and not for humans.
+
+**ASR/MT quality note from the same runs:** translations mostly faithful,
+naturalness mediocre («COVID est toujours en train de piquer»), slang/register
+weak ("cringe"). Consistent with the standing CONDITIONAL MT verdict — the
+native-speaker review (Q1) remains the gate. Dropped-sentence audit trail now
+exists (text logged) so coherence-after-drop can be judged on the next run.
