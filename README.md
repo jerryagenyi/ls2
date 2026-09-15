@@ -28,7 +28,8 @@ The full design rationale — architecture, tech choices and why, known failure 
 ├── requirements.txt                   # pinned Python deps for the venv
 ├── docs/
 │   ├── test-plan.md                   # automated + manual test plan
-│   └── HOW-IT-WORKS.md                # developer mechanics of the pipeline
+│   ├── HOW-IT-WORKS.md                # developer mechanics of the pipeline
+│   └── journal/                       # dated engineering log — what changed and why
 ├── validation/
 │   ├── mt/                            # machine translation smoke test results
 │   ├── tts/                           # TTS voice samples for audition
