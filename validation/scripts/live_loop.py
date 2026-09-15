@@ -91,6 +91,29 @@ def strip_disfluencies(text: str) -> str:
     return re.sub(r"\s{2,}", " ", _FILLER.sub(" ", text)).strip()
 
 
+def drop_prefix_overlap(new, recent):
+    """If `new` starts by repeating the end of `recent`, return the rest."""
+    for k in range(min(len(new), len(recent), 4), 0, -1):
+        if new[:k] == recent[-k:]:
+            return new[k:]
+    return new
+
+
+def split_long_fragment(text: str, max_words: int = 40):
+    """Split an unpunctuated monologue fragment into TTS-sized pieces.
+
+    Dense speakers produce minutes-long unpunctuated runs; one such fragment
+    became a ~60s audio blob live (2026-09-15) and spiked the backlog. The
+    section-8 rule still holds as hard as ever for punctuated speech — this
+    only bounds the already-compromised hold-expiry path.
+    """
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    return [" ".join(words[i:i + max_words])
+            for i in range(0, len(words), max_words)]
+
+
 def complete_sentences(text: str):
     """Split into (complete sentences, leftover tail lacking terminal punct)."""
     sentences, cur = [], []
@@ -180,6 +203,7 @@ class IncrementalASR:
         self.stats = stats
         self.buf = np.empty(0, dtype=np.float32)
         self.committed = 0  # sample offset into buf: transcription is final
+        self.recent = []    # last emitted sentences, for revision-overlap dedupe
 
     def feed(self, chunk: np.ndarray, final: bool = False):
         """Returns (new_complete_sentences, tail_text, asr_ms)."""
@@ -199,6 +223,12 @@ class IncrementalASR:
                 ends.append(self.committed + min(int(end_s * SR), self.buf.size))
         full = " ".join(texts)
         sentences, tail = complete_sentences(full)
+        # Whisper sometimes re-emits already-committed sentences when it
+        # revises (observed live 2026-09-15: "exactly who this person is."
+        # translated twice). Drop a leading run that repeats what we just
+        # emitted; a genuine repeat separated by other content still passes.
+        sentences = drop_prefix_overlap(sentences, self.recent)
+        self.recent = (self.recent + sentences)[-8:]
 
         # Advance commitment past the audio backing the last complete
         # sentence: include whole segments whose text fits inside the
@@ -496,7 +526,8 @@ def main():
             if hold_pending:
                 print("[hold expired — translating incomplete fragment]")
                 tlog.log("en", hold_pending)
-                mt_q.put((hold_pending, None))
+                for part in split_long_fragment(hold_pending):
+                    mt_q.put((part, None))
                 hold_pending, hold_since = "", None
 
         while not stop.is_set():

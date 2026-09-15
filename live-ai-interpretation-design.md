@@ -378,3 +378,38 @@ drops enough that it's never needed — decide after the next measured replay.
 the audit trail for judging coherence-after-drop). Console output unchanged.
 Streaming this to the listener page (WebSocket/SSE) lands with the
 dashboard/F7; the JSONL format is the contract it will feed.
+
+### 13.9 Language switching, transcript tags, and the 2026-09-15 fixes
+
+**Mid-sentence language switching (F3 preview, decided).** Not handled today:
+ASR is pinned `language="en"`, so foreign speech mid-sentence transcribes as
+mangled English and the error propagates to MT/TTS. F3 handling, enabled by
+incremental ASR: detect language **per incremental chunk** (~every 6s, not
+per utterance). On a detected switch, close the session exactly like a pause
+— re-transcribe the un-committed tail under the new language, tag committed
+text and transcript-log records with the detected language (the `kind` field
+becomes a language tag), route MT/TTS per language. Between-sentence
+switches resolve within ~6s; a switch inside a single sentence garbles the
+switch point itself — accepted, documented limit.
+
+**Transcript logging is language-agnostic by construction** (PRD F11): the
+log records whatever text flows through with a kind tag; today the tags are
+the single pair's (en/fr); F3 swaps in detected-language tags, no format
+change.
+
+**Fixes from the 2026-09-15 three-run session** (log:
+`TEST-RESULT_15-9-2026_0700.md`, analysis in `validation/latency/`):
+1. **Revision-duplicate bug** (fixed): Whisper re-emitting already-committed
+   sentences on a later pass reached MT twice ("exactly who this person is."
+   translated twice). `drop_prefix_overlap()` removes a leading run that
+   repeats just-emitted sentences; genuine repeats with intervening content
+   still pass. Unit-tested.
+2. **Giant unpunctuated fragments** (fixed): dense speakers produce
+   minutes-long runs with no terminal punctuation; the hold path flushed
+   them as ONE fragment → one ~60s TTS blob → backlog spike (this, not the
+   flag itself, is why the catch-up run dropped content — the no-flag run
+   hit the same blob as a 39.7s backlog). Hold-flush now splits into ≤40-word
+   pieces. Section 8 unchanged for punctuated speech; this only bounds the
+   already-compromised hold path.
+3. Developer documentation of all mechanics: `docs/HOW-IT-WORKS.md` — the
+   contract is that it is updated in the same commit as any pipeline change.

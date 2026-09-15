@@ -27,7 +27,8 @@ The full design rationale — architecture, tech choices and why, known failure 
 ├── live-loop.cmd                      # run the live mic→French test loop (from repo root)
 ├── requirements.txt                   # pinned Python deps for the venv
 ├── docs/
-│   └── test-plan.md                   # automated + manual test plan
+│   ├── test-plan.md                   # automated + manual test plan
+│   └── HOW-IT-WORKS.md                # developer mechanics of the pipeline
 ├── validation/
 │   ├── mt/                            # machine translation smoke test results
 │   ├── tts/                           # TTS voice samples for audition

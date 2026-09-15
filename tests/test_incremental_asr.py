@@ -64,16 +64,18 @@ def test_committed_audio_is_dropped_buffer_stays_bounded():
     # Many passes, each committing a sentence: buffer must not grow with
     # total session length (only with un-committed tail).
     class Repeater:
-        """Sentence always ends at the end of whatever audio is given —
-        faithful to real Whisper end-timestamps."""
+        """A fresh sentence ending at the end of whatever audio is given —
+        faithful to real Whisper end-timestamps and to real speech (each
+        pass yields NEW sentences, not the same one forever)."""
 
-        def __init__(self, text):
-            self.text = text
+        def __init__(self):
+            self.n = 0
 
         def __call__(self, audio):
-            return [(self.text, len(audio) / SEC)]
+            self.n += 1
+            return [(f"Sentence number {self.n} is done.", len(audio) / SEC)]
 
-    inc = IncrementalASR(Repeater("Sentence number is done."))
+    inc = IncrementalASR(Repeater())
     sizes = []
     for _ in range(20):
         inc.feed(chunk(2.0))
@@ -99,3 +101,45 @@ def test_transcript_log_writes_jsonl(tmp_path):
     assert [l["kind"] for l in lines] == ["en", "fr", "dropped"]
     assert [l["text"] for l in lines] == ["Hello there.", "Bonjour.", "Skipped line."]
     assert all("t" in l for l in lines)
+
+
+def test_drop_prefix_overlap_removes_revision_duplicates():
+    from live_loop import drop_prefix_overlap
+    recent = ["Hello there.", "How are you."]
+    # Whisper re-emits both, then adds new — duplicates dropped
+    assert drop_prefix_overlap(
+        ["Hello there.", "How are you.", "I am fine."], recent
+    ) == ["I am fine."]
+    # No overlap — untouched
+    assert drop_prefix_overlap(["Something new."], recent) == ["Something new."]
+
+
+def test_drop_prefix_overlap_keeps_genuine_repeats():
+    from live_loop import drop_prefix_overlap
+    # "Thank you." repeated with other content between: NOT consecutive
+    # suffix/prefix, so it survives (a real speaker may repeat themselves).
+    recent = ["Thank you.", "Now a thing."]
+    assert drop_prefix_overlap(["Thank you."], recent) == ["Thank you."]
+
+
+def test_split_long_fragment_bounds_tts_blob():
+    from live_loop import split_long_fragment
+    short = " ".join(["word"] * 39)
+    assert split_long_fragment(short) == [short]
+    long_frag = " ".join([f"w{i}" for i in range(95)])
+    parts = split_long_fragment(long_frag)
+    assert len(parts) == 3
+    assert all(len(p.split()) <= 40 for p in parts)
+    assert " ".join(parts) == long_frag  # lossless reassembly
+
+
+def test_incremental_dedupes_revision_prefix():
+    fw = FakeWhisper([
+        [("Alpha one. Beta two.", 2.0)],
+        [("Alpha one. Beta two. Gamma three.", 3.0)],  # re-emits committed pair
+    ])
+    inc = IncrementalASR(fw)
+    s1, _, _ = inc.feed(chunk(2.0))
+    s2, _, _ = inc.feed(chunk(1.0))
+    assert s1 == ["Alpha one.", "Beta two."]
+    assert s2 == ["Gamma three."]
